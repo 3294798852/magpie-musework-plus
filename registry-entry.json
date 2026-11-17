@@ -1,0 +1,11 @@
+{
+  "package": "magpie-musework",
+  "name": "magpie-MuseWork",
+  "providers": [
+    "musework"
+  ],
+  "summary": {
+    "en": "magpie-MuseWork: brings MuseWork (Muse AI) into magpie.",
+    "zh": "magpie-MuseWork：把 MuseWork（Muse AI 的 AI 工作伙伴）接进 magpie。"
+  }
+}
