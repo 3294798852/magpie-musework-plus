@@ -11,11 +11,11 @@ import { execFileSync, spawn } from "node:child_process"
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { setTimeout as delay } from "node:timers/promises"
 
 import { BASE, PATHS } from "./constants.mjs"
 import { userIdOf } from "./auth.mjs"
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+import { requestJson, unwrap, withTimeout } from "./http.mjs"
 
 const WIN_REGISTRY_BROWSERS = [
   "chrome.exe",
@@ -162,33 +162,48 @@ export function parseMusaAuth(raw, uidHint = "") {
   }
 }
 
-async function waitForFile(file, timeoutMs) {
+async function waitForFile(file, timeoutMs, signal) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (existsSync(file)) return true
-    await sleep(200)
+    await delay(200, undefined, { signal })
   }
   return false
 }
 
-function cdpConnect(url) {
+export function cdpConnect(url, signal, openSocket = address => new WebSocket(address)) {
   return new Promise((resolve, reject) => {
-    if (typeof WebSocket !== "function") {
-      reject(new Error("当前运行时不支持浏览器自动登录（需要 Node 22+ 的 WebSocket）"))
-      return
-    }
-    const socket = new WebSocket(url)
+    signal?.throwIfAborted()
+    const socket = openSocket(url)
     const pending = new Map()
     let next = 1
+    let closed = false
+    const stop = (error) => {
+      if (closed) return
+      closed = true
+      signal?.removeEventListener("abort", abort)
+      socket.onopen = socket.onclose = socket.onerror = socket.onmessage = null
+      reject(error)
+      for (const waiter of pending.values()) waiter.rej(error)
+      pending.clear()
+      try { socket.close() } catch {}
+    }
+    const abort = () => stop(signal.reason)
+    signal?.addEventListener("abort", abort, { once: true })
     socket.onopen = () => resolve({
       send(method, params) {
+        if (closed) return Promise.reject(new Error("浏览器调试连接已关闭"))
         const id = next++
         return new Promise((res, rej) => {
           pending.set(id, { res, rej })
-          socket.send(JSON.stringify({ id, method, params: params ?? {} }))
+          try {
+            socket.send(JSON.stringify({ id, method, params: params ?? {} }))
+          } catch (error) {
+            stop(error)
+          }
         })
       },
-      close() { try { socket.close() } catch {} },
+      close() { stop(new Error("浏览器调试连接已关闭")) },
     })
     socket.onmessage = (event) => {
       let message
@@ -199,25 +214,22 @@ function cdpConnect(url) {
       if (message.error) waiter.rej(new Error(message.error.message || "CDP 错误"))
       else waiter.res(message.result)
     }
-    socket.onerror = () => reject(new Error("连不上浏览器的调试端口"))
+    socket.onerror = () => stop(new Error("连不上浏览器的调试端口"))
+    socket.onclose = () => stop(new Error("浏览器调试连接已断开"))
   })
 }
 
-async function browserClient(port) {
-  const response = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(5000) })
-  if (!response.ok) return null
-  const info = await response.json()
-  if (!info?.webSocketDebuggerUrl) return null
-  return cdpConnect(info.webSocketDebuggerUrl)
-}
-
-async function pageClient(port) {
-  const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(5000) })
-  if (!response.ok) return null
-  const targets = await response.json()
-  const page = Array.isArray(targets) ? targets.find((target) => target.type === "page") : null
-  if (!page?.webSocketDebuggerUrl) return null
-  return cdpConnect(page.webSocketDebuggerUrl)
+async function localCDP(port, listPages, signal) {
+  const lookup = "http://127.0.0.1:" + port + (listPages ? "/json/list" : "/json/version")
+  const localSignal = AbortSignal.any([signal, AbortSignal.timeout(5000)])
+  const response = await fetch(lookup, { signal: localSignal, redirect: "error" })
+  if (!response.ok) {
+    void response.body?.cancel().catch(() => {})
+    return null
+  }
+  const body = await response.json()
+  const target = listPages && Array.isArray(body) ? body.find(item => item.type === "page") : body
+  return target?.webSocketDebuggerUrl ? cdpConnect(target.webSocketDebuggerUrl, localSignal) : null
 }
 
 export function refreshTokenOf(cookies) {
@@ -231,17 +243,17 @@ export function refreshTokenOf(cookies) {
 }
 
 /** 用 refresh_token 换 access_token（服务端会作废旧 access_token）。 */
-async function exchangeRefreshToken(refreshToken, fetchImpl = fetch) {
+async function exchangeRefreshToken(refreshToken, fetchImpl, signal) {
   if (!refreshToken) return null
   try {
-    const response = await fetchImpl(`${BASE}${PATHS.refresh}`, {
+    const { response, body } = await requestJson(fetchImpl, BASE + PATHS.refresh, {
       method: "POST",
       headers: { "Content-Type": "application/json", Cookie: `refresh_token=${refreshToken}` },
-      signal: AbortSignal.timeout(20_000),
+      signal,
+      timeoutMs: 20_000,
     })
     if (!response.ok) return null
-    const json = await response.json()
-    const data = json?.data && typeof json.data === "object" ? json.data : json
+    const data = unwrap(body)
     const access = typeof data?.access_token === "string" ? data.access_token.trim() : ""
     const expiresIn = Number(data?.expires_in)
     if (!access || !Number.isFinite(expiresIn) || expiresIn <= 0) return null
@@ -256,14 +268,14 @@ async function exchangeRefreshToken(refreshToken, fetchImpl = fetch) {
  * 优先 **浏览器级** Storage.getCookies（不 attach 页面、不碰 Runtime 域），
  * 拿不到 refresh_token 再回退到页面里读 localStorage.musa_auth。
  */
-async function readLoginState(port, fetchImpl = fetch) {
+async function readLoginState(port, fetchImpl, signal) {
   // ① 浏览器级 cookie（最稳，也最不容易被 Turnstile 风控盯上）
   let browser = null
   try {
-    browser = await browserClient(port)
+    browser = await localCDP(port, false, signal)
     if (browser) {
       const result = await browser.send("Storage.getCookies", {})
-      const cred = await exchangeRefreshToken(refreshTokenOf(result?.cookies), fetchImpl)
+      const cred = await exchangeRefreshToken(refreshTokenOf(result?.cookies), fetchImpl, signal)
       if (cred) return cred
     }
   } catch {
@@ -273,7 +285,7 @@ async function readLoginState(port, fetchImpl = fetch) {
   }
 
   // ② 兜底：页面 localStorage.musa_auth
-  const client = await pageClient(port)
+  const client = await localCDP(port, true, signal)
   if (!client) return null
   try {
     const evaluated = await client.send("Runtime.evaluate", {
@@ -301,38 +313,47 @@ async function readLoginState(port, fetchImpl = fetch) {
 
 /** 打开临时浏览器登录，返回 {access, refresh, expires, uid}；超时/取消会抛错。 */
 export async function chromiumLogin({ browser, url, timeoutMs = 5 * 60 * 1000, signal, fetchImpl = fetch } = {}) {
+  signal?.throwIfAborted()
   const exe = browser || findBrowser()
   if (!exe) throw new Error("没有找到 Chromium 内核浏览器（Chrome / Edge / 360极速 / QQ 等）")
   const profile = mkdtempSync(join(tmpdir(), "magpie-musework-"))
-  const child = spawn(exe, [
-    `--user-data-dir=${profile}`,
-    "--remote-debugging-port=0",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-features=Translate",
-    // 关掉 AutomationControlled 的 Blink 特性，降低被 Turnstile 判成自动化的概率。
-    "--disable-blink-features=AutomationControlled",
-    url,
-  ], { stdio: "ignore" })
+  const login = withTimeout(signal, timeoutMs)
+  const spawnFailure = new AbortController()
+  const loginSignal = AbortSignal.any([login.signal, spawnFailure.signal])
+  let child
   try {
+    child = spawn(exe, [
+      `--user-data-dir=${profile}`,
+      "--remote-debugging-port=0",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-features=Translate",
+      // 关掉 AutomationControlled 的 Blink 特性，降低被 Turnstile 判成自动化的概率。
+      "--disable-blink-features=AutomationControlled",
+      url,
+    ], { stdio: "ignore" })
+    child.once("error", error => spawnFailure.abort(error))
     const portFile = join(profile, "DevToolsActivePort")
-    if (!(await waitForFile(portFile, 15_000))) throw new Error("浏览器没有打开调试端口")
+    if (!(await waitForFile(portFile, 15_000, loginSignal))) throw new Error("浏览器没有打开调试端口")
     const port = Number(readFileSync(portFile, "utf8").split(/\r?\n/)[0])
     if (!Number.isFinite(port) || port <= 0) throw new Error("浏览器调试端口无效")
 
     // 给页面一点时间加载（Turnstile / 登录页脚本）
-    await sleep(2000)
-    const deadline = Date.now() + timeoutMs
-    while (Date.now() < deadline) {
-      signal?.throwIfAborted()
+    await delay(2000, undefined, { signal: loginSignal })
+    for (;;) {
+      loginSignal.throwIfAborted()
       let cred = null
-      try { cred = await readLoginState(port, fetchImpl) } catch {}
+      try { cred = await readLoginState(port, fetchImpl, loginSignal) } catch {}
+      loginSignal.throwIfAborted()
       if (cred) return cred
-      await sleep(2000)
+      await delay(2000, undefined, { signal: loginSignal })
     }
-    throw new Error(`等待登录超时（${Math.max(1, Math.round(timeoutMs / 60_000))} 分钟）`)
+  } catch (error) {
+    if (loginSignal.aborted) throw loginSignal.reason
+    throw error
   } finally {
-    try { child.kill("SIGTERM") } catch {}
+    login.cleanup()
+    try { child?.kill("SIGTERM") } catch {}
     const cleanup = (attempt = 0) => {
       try {
         rmSync(profile, { recursive: true, force: true })

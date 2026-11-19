@@ -19,7 +19,7 @@ function abortError() {
 export function createLimiter(initial = 1) {
   let limit = normalizeLimit(initial)
   let active = 0
-  const waiters = []
+  const waiters = new Set()
 
   function makeRelease() {
     let released = false
@@ -32,11 +32,11 @@ export function createLimiter(initial = 1) {
   }
 
   function pump() {
-    while (active < limit && waiters.length) {
-      const waiter = waiters.shift()
-      if (waiter.aborted) continue
+    while (active < limit && waiters.size) {
+      const waiter = waiters.values().next().value
+      waiters.delete(waiter)
       active += 1
-      waiter.grant()
+      waiter()
     }
   }
 
@@ -48,7 +48,7 @@ export function createLimiter(initial = 1) {
       return active
     },
     get pending() {
-      return waiters.length
+      return waiters.size
     },
     setLimit(value) {
       const next = normalizeLimit(value)
@@ -64,24 +64,45 @@ export function createLimiter(initial = 1) {
         return Promise.resolve(makeRelease())
       }
       return new Promise((resolve, reject) => {
-        const waiter = {
-          aborted: false,
-          onAbort: null,
-          grant: () => {
-            signal?.removeEventListener?.("abort", waiter.onAbort)
-            resolve(makeRelease())
-          },
-        }
-        waiter.onAbort = () => {
-          if (waiter.aborted) return
-          waiter.aborted = true
-          const index = waiters.indexOf(waiter)
-          if (index >= 0) waiters.splice(index, 1)
+        const onAbort = () => {
+          waiters.delete(grant)
           reject(abortError())
         }
-        signal?.addEventListener?.("abort", waiter.onAbort, { once: true })
-        waiters.push(waiter)
+        const grant = () => {
+          signal?.removeEventListener("abort", onAbort)
+          resolve(makeRelease())
+        }
+        signal?.addEventListener("abort", onAbort, { once: true })
+        waiters.add(grant)
       })
+    },
+  }
+}
+
+export function createAccountLimiters() {
+  const accounts = new Map()
+
+  return {
+    get size() { return accounts.size },
+    update(key, limit) { accounts.get(key)?.setLimit(limit) },
+    async acquire(key, limit, signal) {
+      let limiter = accounts.get(key)
+      if (!limiter) {
+        limiter = createLimiter(limit)
+        accounts.set(key, limiter)
+      } else {
+        limiter.setLimit(limit)
+      }
+      const collectIdle = () => {
+        if (!limiter.active && !limiter.pending && accounts.get(key) === limiter) accounts.delete(key)
+      }
+      try {
+        const release = await limiter.acquire(signal)
+        return () => { release(); collectIdle() }
+      } catch (error) {
+        collectIdle()
+        throw error
+      }
     },
   }
 }

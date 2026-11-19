@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import { buildContent, reasoningEffortOf, timezoneOf } from "../src/chat.mjs"
+import { readLimitedText } from "../src/http.mjs"
 
 const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 
@@ -85,4 +86,20 @@ test("timezoneOf 返回合法 IANA 名称或空串", () => {
   const tz = timezoneOf()
   assert.equal(typeof tz, "string")
   if (tz) assert.doesNotMatch(tz, /[\r\n]/)
+})
+
+test("metadata without a length header stops downloading at its byte limit", async () => {
+  let pulled = 0
+  let cancelled = 0
+  const response = new Response(new ReadableStream({
+    pull(controller) {
+      pulled += 1
+      controller.enqueue(new Uint8Array(8))
+    },
+    cancel() { cancelled += 1 },
+  }, { highWaterMark: 0 }))
+  await assert.rejects(readLimitedText(response, 12), { status: 502 })
+  assert.equal(pulled, 2)
+  assert.equal(cancelled, 1)
+  assert.equal(response.body.locked, false)
 })

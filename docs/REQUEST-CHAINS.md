@@ -200,7 +200,7 @@ event:error               {"code":"BAD_REQUEST","message":"…"}   ← 出错时
 - `reply` 的 `payload.content_delta` → OpenAI `delta.content`
 - `reasoning` 的 `payload.delta` → `delta.reasoning_content`
 - `component.end(reply)` 的 `payload.content` 只在没有增量时兜底
-- `tool_call` / `model_request` / `summary` 不往外发
+- `tool_call`、`model_request` 和 `summary` 属于 MuseWork 内部事件。客户端函数通过正文协议返回，见 [工具调用](../README.md#工具调用)
 - `session.idle` → finish chunk + `data: [DONE]`
 - `error` → 错误帧 `{"error":{message,type,code,status}}`（HTTP 200 已定）
 
@@ -211,7 +211,7 @@ X-Device-Type: desktop
 X-Device-ID: <device.id>
 ```
 
-每轮结束（成功 / 失败 / 取消）都删；删除失败吞掉。客户端取消响应流时会额外 abort 本轮的 `AbortSignal`（`turnController`），让上游 fetch 立即断开，避免模型继续跑完扣积分。
+每轮成功、失败或取消后提交一次删除。删除请求独立于客户端信号，最多等 5 秒。失败写入不含会话 ID 的日志。客户端取消后会中止本轮上游连接。
 
 ## 6. 额度链路
 
@@ -280,7 +280,7 @@ Content-Type: application/json
 
 | 情况 | 行为 |
 |---|---|
-| `CONCURRENT_SESSION_LIMIT_EXCEEDED`（HTTP 200 + SSE error） | **每账号一个**闸门（`src/semaphore.mjs`，按 `cacheKeyOf(auth)` 分桶，limit = `max_concurrent_sessions`）；账号间互不排队。还没发正文时 1s/2s 退避重试，最多 3 次 |
+| `CONCURRENT_SESSION_LIMIT_EXCEEDED`（HTTP 200 + SSE error） | 同账号按任务和会话两项配额中较小者排队。HTTP 错误或 SSE 尚无有效增量时，统一使用 1 秒和 2 秒退避，总计最多 3 次尝试 |
 | `401` / `USER_INVALID_TOKEN` | 标记 `session_expired`，宿主换号或要求重登 |
 | 5xx / 超时 | 原样透传（502/503/504），宿主换号 |
 | 客户端 abort | abort 本轮上游 fetch、取消上游流、删会话、释放闸门 |

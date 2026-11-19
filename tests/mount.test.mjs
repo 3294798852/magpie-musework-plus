@@ -8,7 +8,6 @@ import test from "node:test"
 process.env.MAGPIE_CONFIG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "musework-mount-"))
 
 const { MuseWorkAuthPlugin, _internal } = await import("../index.mjs")
-const { clearAgentCache } = await import("../src/catalog.mjs")
 
 function jwt(payload) {
   const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url")
@@ -120,7 +119,7 @@ function fakeFetch({ chatFrames = CHAT_FRAMES, chatStatus = null, dailyClaimed =
     }
     if (url.endsWith("/api/v1/chat/completions")) {
       if (chatStatus) return jsonResponse({ code: "BAD_REQUEST", message: "Invalid request" }, chatStatus)
-      return sseResponse(chatFrames)
+      return sseResponse(typeof chatFrames === "function" ? chatFrames(JSON.parse(entry.body)) : chatFrames)
     }
     if (url.endsWith("/api/v1/credits/balance")) {
       return jsonResponse({
@@ -181,7 +180,6 @@ test("loader GET /models 返回 OpenAI 列表", async () => {
 })
 
 test("loader POST /chat/completions 流式翻译成 OpenAI chunk", async () => {
-  clearAgentCache()
   const { impl, calls } = fakeFetch()
   const plugin = await MuseWorkAuthPlugin({}, { fetch: impl })
   const loader = await plugin.auth.loader(async () => authObject())
@@ -216,7 +214,6 @@ test("loader POST /chat/completions 流式翻译成 OpenAI chunk", async () => {
 })
 
 test("loader 非流式折叠成 chat.completion", async () => {
-  clearAgentCache()
   const { impl } = fakeFetch()
   const plugin = await MuseWorkAuthPlugin({}, { fetch: impl })
   const loader = await plugin.auth.loader(async () => authObject())
@@ -230,7 +227,6 @@ test("loader 非流式折叠成 chat.completion", async () => {
 })
 
 test("上游 HTTP 400 → 插件返回 400 + invalid_request", async () => {
-  clearAgentCache()
   const { impl } = fakeFetch({ chatStatus: 400 })
   const plugin = await MuseWorkAuthPlugin({}, { fetch: impl })
   const loader = await plugin.auth.loader(async () => authObject())
@@ -255,7 +251,6 @@ test("不支持的端点 → 501 not_implemented", async () => {
 })
 
 test("provider.models 用实时目录", async () => {
-  clearAgentCache()
   const { impl } = fakeFetch()
   const plugin = await MuseWorkAuthPlugin({}, { fetch: impl })
   const models = await plugin.provider.models({}, { auth: authObject() })
@@ -409,7 +404,6 @@ test("本机有多个账号时逐个导入，导入完给出提示", async (t) =
 })
 
 test("并发会话上限：首个请求回 CONCURRENT_SESSION_LIMIT_EXCEEDED，自动重试成功", async () => {
-  clearAgentCache()
   let chatCalls = 0
   const impl = async (input, init = {}) => {
     const url = typeof input === "string" ? input : String(input?.url || "")
@@ -457,7 +451,6 @@ test("并发会话上限：首个请求回 CONCURRENT_SESSION_LIMIT_EXCEEDED，�
 })
 
 test("客户端取消响应流会 abort 上游 fetch（避免中断后继续扣费）", async () => {
-  clearAgentCache()
   let aborted = false
   let streamController = null
   const impl = async (input, init = {}) => {
@@ -520,5 +513,116 @@ test("浏览器登录：authorize 不再有 prompts（密码输入已移除）",
 test("_internal 暴露诊断件", () => {
   assert.equal(_internal.PROVIDER, "musework")
   assert.equal(typeof _internal.staticModels, "function")
-  assert.equal(typeof _internal.clearCaches, "function")
+  assert.equal(typeof _internal.cacheKeyOf, "function")
+  assert.notEqual(_internal.cacheKeyOf({ access: TOKEN }), TOKEN)
+})
+
+test("loader closes a client tool loop through both response formats", async () => {
+  const tools = ["probe", "verify"].map(name => ({
+    type: "function", function: { name, parameters: { type: "object" } },
+  }))
+  for (const stream of [false, true]) {
+    let toolTurns = 0
+    const { impl, calls } = fakeFetch({
+      chatFrames(body) {
+        const text = body.content.map(block => block.text || "").join("\n")
+        assert.equal(body.tools, undefined)
+        const marker = text.match(/MUSEWORK_CALL_[a-f0-9]+:/u)?.[0]
+        assert.ok(marker)
+        if (++toolTurns === 2) {
+          assert.match(text, /"tool_call_id":"call_[a-f0-9]+_0","content":"value-1"/)
+          assert.match(text, /"tool_call_id":"call_[a-f0-9]+_1","content":"value-2"/)
+          assert.match(text, /已发出的客户端函数调用/)
+          return CHAT_FRAMES
+        }
+        const reply = marker + '[{"name":"probe","arguments":{"id":1}},{"name":"verify","arguments":{}}]'
+        return [
+          sse("component.content", { component_type: "reply", id: "r1", payload: { content_delta: reply.slice(0, 10) } }),
+          sse("component.content", { component_type: "reply", id: "r1", payload: { content_delta: reply.slice(10) } }),
+          sse("session.idle", {}),
+        ]
+      },
+    })
+    const plugin = await MuseWorkAuthPlugin({}, { fetch: impl })
+    const loader = await plugin.auth.loader(async () => authObject())
+    const url = "https://museai.im/api/v1/chat/completions"
+    const send = body => loader.fetch(url, { method: "POST", body: JSON.stringify(body) })
+    const user = { role: "user", content: "Use the client tools" }
+    const response = await send({ model: "m", messages: [user], tools, tool_choice: "required", stream })
+    assert.equal(response.status, 200)
+    let toolCalls
+    if (stream) {
+      const raw = await response.text()
+      assert.match(raw, /data: \[DONE\]/)
+      assert.doesNotMatch(raw, /MUSEWORK_CALL_/)
+      const choices = raw.split("\n").filter(line => line.startsWith("data: {"))
+        .map(line => JSON.parse(line.slice(6)).choices[0])
+      assert.equal(choices.at(-1).finish_reason, "tool_calls")
+      const indexed = choices.flatMap(choice => choice.delta.tool_calls || [])
+      assert.deepEqual(indexed.map(call => call.index), [0, 1])
+      toolCalls = indexed.map(({ index, ...call }) => call)
+    } else {
+      const choice = (await response.json()).choices[0]
+      assert.equal(choice.finish_reason, "tool_calls")
+      assert.equal(choice.message.content, null)
+      toolCalls = choice.message.tool_calls
+    }
+    assert.deepEqual(toolCalls.map(call => call.function.name), ["probe", "verify"])
+    assert.deepEqual(JSON.parse(toolCalls[0].function.arguments), { id: 1 })
+    const last = await send({
+      model: "m", tools, stream: false,
+      messages: [
+        user, { role: "assistant", content: null, tool_calls: toolCalls },
+        ...toolCalls.map((call, index) => ({ role: "tool", tool_call_id: call.id, content: "value-" + (index + 1) })),
+      ],
+    })
+    assert.equal((await last.json()).choices[0].message.content, "Hi")
+    assert.equal(calls.filter(call => call.url.endsWith("/delete")).length, 2)
+  }
+})
+
+test("stream holds the account through asynchronous session deletion and honors backpressure", async () => {
+  const base = fakeFetch()
+  const allowDelete = Promise.withResolvers()
+  const deleteStarted = Promise.withResolvers()
+  let opened = 0
+  let deleted = 0
+  let pulled = 0
+  const plugin = await MuseWorkAuthPlugin({}, { fetch: async (url, init) => {
+    if (url.endsWith("/delete")) {
+      if (++deleted === 1) {
+        deleteStarted.resolve()
+        await allowDelete.promise
+      }
+    }
+    if (url.endsWith("/chat/completions") && ++opened === 1) {
+      const bytes = new TextEncoder().encode(CHAT_FRAMES[1])
+      return new Response(new ReadableStream({
+        pull(controller) { pulled += 1; controller.enqueue(bytes) },
+      }, { highWaterMark: 0 }))
+    }
+    return base.impl(url, init)
+  } })
+  const loader = await plugin.auth.loader(async () => authObject())
+  const ask = stream => loader.fetch("https://museai.im/api/v1/chat/completions", {
+    method: "POST", body: JSON.stringify({ stream, messages: [{ role: "user", content: "test" }] }),
+  })
+
+  const first = (await ask(true)).body.getReader()
+  const { value } = await first.read()
+  assert.match(new TextDecoder().decode(value), /"content":"Hi"/)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(pulled, 1)
+  const pending = ask(false)
+  const cancelled = first.cancel()
+  await deleteStarted.promise
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(opened, 1)
+  assert.equal(deleted, 1)
+  allowDelete.resolve()
+  await cancelled
+  first.releaseLock()
+  assert.equal((await (await pending).json()).choices[0].message.content, "Hi")
+  assert.equal(opened, 2)
+  assert.equal(deleted, 2)
 })

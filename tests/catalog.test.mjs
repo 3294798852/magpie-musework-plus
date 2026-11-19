@@ -30,7 +30,7 @@ test("modelEntry 保留 key/name/rate 与能力字段", () => {
   assert.equal(entry.free, false)
   assert.equal(entry.capabilities.reasoning, true)
   assert.equal(entry.capabilities.attachment, true)
-  assert.equal(entry.capabilities.toolcall, false)
+  assert.equal(entry.capabilities.toolcall, true)
   assert.equal(entry.capabilities.input.image, true)
   assert.deepEqual(Object.keys(entry.variants), ["low", "medium", "high"])
 })
@@ -63,7 +63,7 @@ test("staticModels 覆盖全部 5 个模型", () => {
   ])
   for (const entry of Object.values(models)) {
     assert.equal(entry.attachment, true)
-    assert.equal(entry.tool_call, false)
+    assert.equal(entry.tool_call, true)
   }
 })
 

@@ -1,96 +1,49 @@
-# magpie-MuseWork
+# MuseWork Plus
 
-把 [MuseWork](https://museai.im)（Muse AI 的 AI 工作伙伴，MuBear 北极熊）接进 [magpie](https://usemagpie.ai)。
+把 [MuseWork](https://museai.im) 接入 Magpie，支持客户端函数调用、流式文本与推理、图片输入、模型目录、积分额度和每日签到。基于 [baijiu666/magpie-MuseWork](https://github.com/baijiu666/magpie-MuseWork) 改进，沿用 MIT 许可证。
 
-- **Provider id**：`musework`
-- **显示名**：MuseWork
-- **模型**：`gpt-6.1-terra` / `gpt-6.1-sol` / `gpt-6-astra` / `gpt-6-luna` / `deepseek-v4-1-flash`
-  - Free 账号实际可用：`gpt-6-luna`、`deepseek-v4-1-flash`
-  - `gpt-6.1-terra` / `gpt-6.1-sol` / `gpt-6-astra` 的 `available:false` 会被服务端**静默降级**到
-    `deepseek-v4-1-flash-261017`（插件因此只列 `available:true` 的模型）
-- **能力**：流式对话、思考档位（low / medium / high / extra_high / max）、图片输入、积分额度卡片、每日签到
+## 安装
 
-## 快速开始
+在 Magpie 打开「插件 → 发现 → 非官方插件 → GitHub」，搜索 `magpie-musework-plus`，核对仓库所有者为 `3294798852`。也可固定版本安装。
 
 ```bash
-magpie plugin add "D:\AI\magpie\magpie-MuseWork"
+magpie plugin add github:3294798852/magpie-musework-plus#v0.2.0
 magpie plugin login musework
 ```
 
-登录方式三选一：
+供应商 ID 仍是 `musework`。已经登录原版的用户可以复用已有账号。如果同时安装两个插件，在「已安装」内选本插件服务 MuseWork。
 
-| 方式 | 需要什么 | 说明 |
-|---|---|---|
-| **从本机 MuseWork 客户端导入** | 已安装并登录 MuseWork 桌面端 | 零输入，读 `~/.musa/users/*/auth-token.json`；有多个账号时每次点击导入下一个，全部导入后提示 |
-| **浏览器登录（打开 museai.im）** | 一个 Chromium 内核浏览器 | 打开临时 Chrome/Edge 窗口，密码 / Google / Apple / 人机验证全交给官方页面；插件优先用浏览器级 CDP 读 `refresh_token` cookie 换 access_token，读不到再回退 `localStorage.musa_auth`。若「安全验证」失败，再点一次「登录」 |
-| **粘贴 Access Token** | 一个有效的 `access_token` | 没有浏览器、或想手动控制时的兜底 |
+| 登录方式 | 所需条件 |
+| --- | --- |
+| 从本机 MuseWork 客户端导入 | 桌面端已登录，多账号按次导入 |
+| 浏览器登录 | Chromium 浏览器和可正常登录的 MuseWork 网页账号 |
+| 粘贴 Access Token | 有效的访问令牌或客户端导出的登录 JSON |
 
-## 它做了什么
+Magpie 将登录态保存在 `~/.config/magpie/plugin-auth.json`。插件的设备 ID 存在同目录的 `musework-device.json`。本机导入从 `~/.musa/` 读取登录态。
 
-| 钩子 | 实现 |
-|---|---|
-| `config` | 声明 provider + 5 个静态模型（未登录也有目录） |
-| `auth.methods` | 三条登录路径（本机导入 / 浏览器登录 / 粘贴 token） |
-| `auth.refresh` | `POST /api/v1/auth/tokens/refresh`（Cookie: `refresh_token`） |
-| `auth.loader` | 接管 `/chat/completions` 与 `GET /models`，其余 501 |
-| `auth.usage` | 积分余额 + 套餐（`credits/balance` + `subscription`） |
-| `auth.checkin` | 每日奖励领取（`daily-rewards/status` + `daily-rewards/claim`，D1 50 → D5+ 300） |
-| `provider.models` | 实时目录 `GET /api/v1/sessions/models` |
-| `chat.headers` | `x-magpie-session-id`（诊断用） |
+## 工具调用
 
-## 协议（10.0.3 实测）
+在 Magpie 网关选择 `musework/deepseek-v4-1-flash` 或 `musework/gpt-6-luna`，按标准 Chat Completions 协议传入 `tools`。插件从 MuseWork 的正文解析本轮调用，返回 OpenAI 形状的 `tool_calls`。客户端执行对应函数，并在下一轮带上调用 ID 和工具结果。
 
-```
-登录      浏览器打开 https://museai.im       localStorage.musa_auth + refresh_token cookie
-          （协议层等价于 POST /api/v2/auth/sessions，插件不再直接发密码）
-续期      POST /api/v1/auth/tokens/refresh      Cookie: refresh_token=<token>
-当前账号  GET  /api/v1/users/self
-模型目录  GET  /api/v1/sessions/models[?locale=zh-CN]
-智能体    GET  /api/v1/agents?specialty=all     → channels[].channel_id
-建会话    POST /api/v1/sessions                 {agent_id,channel_id,model_key,reasoning_effort}
-对话      POST /api/v1/chat/completions         SSE: component.start/content/end
-额度      GET  /api/v1/credits/balance
-套餐      GET  /api/v1/subscription
-签到状态  GET  /api/v1/daily-rewards/status
-签到领取  POST /api/v1/daily-rewards/claim
-```
+- 支持 `auto`、`none`、`required`、指定函数和 `parallel_tool_calls`，支持 SSE 与 JSON。
+- 参数定义随提示发送给模型。约束解码 `strict: true`、自定义 grammar 工具和旧版 `functions/function_call` 会返回参数错误。
+- 工具回合取决于模型遵循输出格式。使用客户端工具的模型仍可访问其 MuseWork 账号上的云端上下文。客户端按自身的参数校验和授权规则执行函数。
 
-上游是有状态智能体，`content` 只放「这一轮用户说了什么」。插件把 magpie 的完整
-`messages` 压平成一条带角色标记的用户消息（`【系统提示】/【用户】/【助手】/【工具结果】`），
-并且**每个请求新建一个会话、结束即删**：
+## 模型与额度
 
-- 不污染用户在 MuseWork 客户端里的会话列表；
-- 不同 magpie 会话之间不串上下文；
-- 失败重试天然是干净的一轮。
+已登录时读取账号可用模型和思考档位。Free 账号通常提供 DeepSeek V4.1 Flash 与 GPT-6 Luna。额度窗口合计每日和奖励积分，日额度在北京时间 00:00 重置。
 
-## 边界
+插件每轮新建独立会话并在结束时清理。相同账号的并发遵守其套餐额度，账号间独立调度。
 
-- **不支持 OpenAI function calling**：MuseWork 智能体有自己的工具（bash / 浏览器 / 文件），
-  不会回 `tool_calls`。模型条目标了 `toolcall: false`。
-- **思考档位**：请求体里的 `reasoning_effort`（或 `reasoning.effort` /
-  `providerOptions.musework.reasoningEffort`）会透传给上游；缺省 `medium`。
-- **额度口径**：`credits/balance` 的 daily + bonus 两个池合成一条「积分」窗口，
-  `resetsAt` 是北京时间次日 00:00。
-- **签到**：网页版「每日奖励」的签到（D1 50 → D2 100 → D3 150 → D4 200 → D5+ 300）。
-  `daily-rewards/status` 判断今天是否已领，`daily-rewards/claim` 领取；
-  领取后 `today_reward` 会变成下一档（D1 50 → D2 100）。
-
-## 本机文件
-
-| 文件 | 用途 |
-|---|---|
-| `~/.config/magpie/musework-device.json` | 插件自己的 `X-Device-ID`（首次生成） |
-| `~/.config/magpie/plugin-auth.json` | magpie 保存的登录态（含 refresh_token） |
-| `~/.musa/` | MuseWork 桌面端数据目录（只读，用于「本机导入」） |
-
-## 开发
+## 开发与验证
 
 ```bash
-npm test                 # 73 个测试
-node scripts/probe.mjs   # 用本机客户端登录态跑真机链路
-MAGPIE_MUSEWORK_TOKEN_FILE=token.txt node scripts/probe.mjs --plain --image --usage
+npm test
+bun test
+node --expose-gc scripts/benchmark.mjs .
+MUSEWORK_TEST_URL=http://127.0.0.1:3425 node scripts/smoke-tools.mjs
 ```
 
-## 许可证
+工具验证使用已授权的 Magpie 网关，并消耗少量 MuseWork 积分。网关要求密钥时通过 `MUSEWORK_TEST_KEY` 提供。
 
-MIT
+[改造方案与验收记录](docs/DEVELOPMENT.md) · [上游协议](docs/REQUEST-CHAINS.md) · [模型归因方法](docs/MODEL-FINGERPRINT.md)

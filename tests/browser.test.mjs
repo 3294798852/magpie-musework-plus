@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { browserCandidates, findBrowser, parseMusaAuth, refreshTokenOf } from "../src/browser.mjs"
+import { browserCandidates, cdpConnect, findBrowser, parseMusaAuth, refreshTokenOf } from "../src/browser.mjs"
 
 const ACCESS = "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiOTI3OTQ3Mjk0ODMifQ.sig"
 
@@ -50,4 +50,31 @@ test("refreshTokenOf 只认 museai.im 的 refresh_token", () => {
   assert.equal(refreshTokenOf([{ name: "refresh_token", value: "r2", domain: "evil-museai.im" }]), "")
   assert.equal(refreshTokenOf(null), "")
   assert.equal(refreshTokenOf([]), "")
+})
+
+test("closing browser transport rejects every pending command and clears handlers", async () => {
+  let closed = 0
+  const socket = { send() {}, close() { closed += 1 } }
+  const connection = cdpConnect("ws://localhost/mock", undefined, () => socket)
+  socket.onopen()
+  const client = await connection
+  const one = client.send("Storage.getCookies")
+  const two = client.send("Runtime.evaluate")
+  socket.onclose()
+  await assert.rejects(one, /连接已断开/)
+  await assert.rejects(two, /连接已断开/)
+  await assert.rejects(client.send("Network.enable"), /连接已关闭/)
+  assert.equal(closed, 1)
+  assert.equal(socket.onmessage, null)
+})
+
+test("aborting DevTools before the handshake closes its socket", async () => {
+  const controller = new AbortController()
+  let closed = 0
+  const socket = { close() { closed += 1 } }
+  const connection = cdpConnect("ws://localhost/mock", controller.signal, () => socket)
+  controller.abort()
+  await assert.rejects(connection, { name: "AbortError" })
+  assert.equal(closed, 1)
+  assert.equal(socket.onopen, null)
 })

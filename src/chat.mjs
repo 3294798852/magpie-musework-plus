@@ -1,16 +1,12 @@
-// 对话主链路：建会话 → POST /api/v1/chat/completions → 转 SSE。
-//
-// 上游是**有状态**的智能体：会话里保留历史，content 只放「这一轮用户说了什么」。
-// magpie 每次请求都带完整 messages，所以这里把整段对话压平成一条用户消息
-// （带角色标记），并且**每个请求新建一个会话、结束即删**：
-//   · 不污染用户在 MuseWork 客户端里的会话列表；
-//   · 不同 magpie 会话之间不会串上下文；
-//   · 失败重试天然是干净的一轮。
-
+// One isolated MuseWork session per OpenAI turn. The client supplies the full
+// conversation, so retries and tool result turns do not need remote history.
+import { randomUUID } from "node:crypto"
+import { setTimeout as delay } from "node:timers/promises"
 import { BASE, PATHS, REASONING_EFFORTS } from "./constants.mjs"
 import { chatErrorStatus, errorCode, httpError, upstreamError } from "./errors.mjs"
-import { authHeaders, jsonHeaders, requestJson, unwrap } from "./http.mjs"
-import { MuseTranslator, foldFrames } from "./translate.mjs"
+import { authHeaders, jsonHeaders, readLimitedText, requestJson, unwrap, withTimeout } from "./http.mjs"
+import { prepareTools } from "./tools.mjs"
+import { MuseTranslator } from "./translate.mjs"
 
 const LABELS = Object.freeze({
   system: "【系统提示】",
@@ -22,57 +18,48 @@ const LABELS = Object.freeze({
 })
 
 const MAX_CONTENT_CHARS = 1_000_000
-
-function textOf(value) {
-  return typeof value === "string" ? value : ""
-}
+const MAX_ATTEMPTS = 3
+const DELETE_TIMEOUT_MS = 5_000
+const encoder = new TextEncoder()
 
 function parseImageUrl(url) {
   const text = String(url ?? "").trim()
   if (!text) return null
   const match = /^data:(image\/[a-z0-9.+-]+);base64,([\s\S]+)$/iu.exec(text)
-  if (match) {
-    return { source: { data: match[2].replace(/\s+/gu, ""), media_type: match[1].toLowerCase() } }
-  }
-  if (/^https?:\/\//iu.test(text)) return { source: { url: text } }
-  return null
+  if (match) return { data: match[2].replace(/\s+/gu, ""), media_type: match[1].toLowerCase() }
+  return /^https?:\/\//iu.test(text) ? { url: text } : null
 }
 
-/**
- * OpenAI messages → MuseWork content 块。
- * 纯单轮 user 消息保持原文（不带角色标记）；多轮/系统提示带【角色】前缀。
- */
-export function buildContent(messages) {
-  const list = Array.isArray(messages) ? messages.filter((item) => item && typeof item === "object") : []
+/** OpenAI messages → MuseWork text and image blocks. */
+export function buildContent(messages, toolPrompt) {
+  const list = Array.isArray(messages) ? messages.filter(item => item && typeof item === "object") : []
   const blocks = []
-  let index = 0
+  let pendingText = []
+  let total = 0
 
-  const pushText = (value) => {
-    const text = String(value ?? "")
-    if (!text.trim()) return
-    const last = blocks[blocks.length - 1]
-    if (last && last.type === "text") {
-      last.text += `\n\n${text}`
-      return
+  const addLength = length => {
+    total += length
+    if (total > MAX_CONTENT_CHARS) {
+      throw upstreamError("对话内容超过 MuseWork 单轮上限（约 100 万字符），请开启新会话", 400, {
+        code: "invalid_request",
+      })
     }
-    blocks.push({ id: `text-${index += 1}`, type: "text", text })
   }
-
-  const pushImage = (url) => {
-    const parsed = parseImageUrl(url)
-    if (!parsed) return
-    blocks.push({
-      id: `image-${index += 1}`,
-      type: "image",
-      image: { source: parsed.source, title: "image" },
-    })
+  const flushText = () => {
+    if (!pendingText.length) return
+    blocks.push({ id: "text-" + (blocks.length + 1), type: "text", text: pendingText.join("\n\n") })
+    pendingText = []
+  }
+  const pushText = text => {
+    if (!text.trim()) return
+    addLength(text.length + (pendingText.length ? 2 : 0))
+    pendingText.push(text)
   }
 
   const onlyUser = list.length === 1 && String(list[0].role ?? "").toLowerCase() === "user"
-
   for (const message of list) {
     const role = String(message.role ?? "user").toLowerCase()
-    const label = onlyUser ? "" : (LABELS[role] ?? `【${role}】`)
+    const label = onlyUser ? "" : (LABELS[role] ?? "【" + role + "】")
     const textChunks = []
     const images = []
     const content = message.content
@@ -82,10 +69,9 @@ export function buildContent(messages) {
     } else if (Array.isArray(content)) {
       for (const part of content) {
         if (!part || typeof part !== "object") continue
-        if (part.type === "text" && typeof part.text === "string") textChunks.push(part.text)
+        if ((part.type === "text" || part.type === "input_text") && typeof part.text === "string") textChunks.push(part.text)
         else if (part.type === "image_url") {
-          const url = typeof part.image_url === "string" ? part.image_url : textOf(part.image_url?.url)
-          if (url) images.push(url)
+          images.push(typeof part.image_url === "string" ? part.image_url : part.image_url?.url)
         } else if (part.type === "input_image" && typeof part.image_url === "string") {
           images.push(part.image_url)
         } else if (part.type === "image" && typeof part.image === "string") {
@@ -96,44 +82,57 @@ export function buildContent(messages) {
       textChunks.push(content.text)
     }
 
-    const text = textChunks.join("\n").trim()
-    if (text) pushText(label ? `${label}\n${text}` : text)
-    for (const url of images) pushImage(url)
+    let text = textChunks.join("\n").trim()
+    if (role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length) {
+      const calls = message.tool_calls.map(call => ({
+        id: call?.id, name: call?.function?.name, arguments: call?.function?.arguments,
+      }))
+      text += (text ? "\n" : "") + "已发出的客户端函数调用 " + JSON.stringify(calls)
+    } else if (role === "tool" && typeof message.tool_call_id === "string") {
+      text = JSON.stringify({ tool_call_id: message.tool_call_id, name: message.name, content: text })
+    }
+    if (text) pushText(label ? label + "\n" + text : text)
+    for (const url of images) {
+      const source = parseImageUrl(url)
+      if (!source) continue
+      addLength(256)
+      flushText()
+      blocks.push({ id: "image-" + (blocks.length + 1), type: "image", image: { source, title: "image" } })
+    }
   }
 
-  const total = blocks.reduce((sum, block) => sum + (block.type === "text" ? block.text.length : 256), 0)
-  if (total > MAX_CONTENT_CHARS) {
-    throw upstreamError(`对话内容超过 MuseWork 单轮上限（约 ${Math.round(MAX_CONTENT_CHARS / 1000)}k 字符），请开启新会话`, 400, {
-      code: "invalid_request",
-    })
-  }
+  if (total && toolPrompt) pushText(toolPrompt)
+  flushText()
   return blocks
 }
 
-/** 请求体里各种可能的思考档位写法 → 上游 reasoning_effort。 */
+export function prepareChat(body) {
+  const toolPlan = prepareTools(body)
+  const content = buildContent(body?.messages, toolPlan?.prompt)
+  if (!content.length) throw upstreamError("messages 不能为空", 400, { code: "invalid_request" })
+  return { content, toolPlan }
+}
+
 export function reasoningEffortOf(body, fallback = "medium") {
   const raw = body?.reasoning_effort
     ?? body?.reasoning?.effort
     ?? body?.providerOptions?.musework?.reasoningEffort
     ?? body?.provider_options?.musework?.reasoning_effort
-  const text = String(raw ?? "").trim().toLowerCase()
-  if (!text) return fallback
-  const normalized = text.replace(/-/gu, "_")
-  return REASONING_EFFORTS.includes(normalized) ? normalized : fallback
+  const text = String(raw ?? "").trim().toLowerCase().replace(/-/gu, "_")
+  return REASONING_EFFORTS.includes(text) ? text : fallback
 }
 
+let timezone
 export function timezoneOf() {
-  try {
+  if (timezone === undefined) {
     const tz = Intl.DateTimeFormat().resolvedOptions().timeZone
-    return typeof tz === "string" && tz && tz.length <= 64 && !/[\r\n]/u.test(tz) ? tz : ""
-  } catch {
-    return ""
+    timezone = typeof tz === "string" && tz.length <= 64 && !/[\r\n]/u.test(tz) ? tz : ""
   }
+  return timezone
 }
 
-/** POST /api/v1/sessions */
 export async function createSession(fetchImpl, { token, device, agentId, channelId, modelKey, reasoningEffort, signal } = {}) {
-  const { response, body } = await requestJson(fetchImpl, `${BASE}${PATHS.sessions}`, {
+  const { response, body } = await requestJson(fetchImpl, BASE + PATHS.sessions, {
     method: "POST",
     headers: jsonHeaders(token, device),
     body: JSON.stringify({
@@ -143,7 +142,6 @@ export async function createSession(fetchImpl, { token, device, agentId, channel
       ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
     }),
     signal,
-    timeoutMs: 30_000,
     maxBytes: 1024 * 1024,
   })
   if (!response.ok) throw httpError(response.status, body)
@@ -157,294 +155,251 @@ export async function createSession(fetchImpl, { token, device, agentId, channel
   }
 }
 
-/** 尽力删除会话（可等待；失败吞掉，不影响结果）。 */
 export async function deleteSession(fetchImpl, { token, device, sessionId } = {}) {
   if (!sessionId) return
+  const { signal, cleanup } = withTimeout(undefined, DELETE_TIMEOUT_MS)
   try {
-    await fetchImpl(`${BASE}${PATHS.sessions}/${encodeURIComponent(sessionId)}/delete`, {
+    const response = await fetchImpl(BASE + PATHS.sessions + "/" + encodeURIComponent(sessionId) + "/delete", {
       method: "POST",
       headers: authHeaders(token, device),
+      signal,
+      redirect: "error",
     })
+    void response.body?.cancel().catch(() => {})
+    if (!response.ok) console.warn("[MuseWork] 删除上游会话失败，HTTP " + response.status)
   } catch {
-    // 删不掉不影响本轮结果
+    console.warn("[MuseWork] 删除上游会话时连接失败或超时")
+  } finally {
+    cleanup()
   }
 }
 
-/** 并发会话上限：上游回 CONCURRENT_SESSION_LIMIT_EXCEEDED（HTTP 200 + SSE error 帧）。 */
 export function isConcurrencyLimit(error) {
-  const status = Number(error?.status) || 0
-  if (status === 409) return true
-  return /CONCURRENT_SESSION|CONCURRENT_LIMIT|CONCURRENT/i.test(
+  return error?.status === 409 || /CONCURRENT_SESSION|CONCURRENT_LIMIT|CONCURRENT/i.test(
     String(error?.upstreamCode || error?.code || error?.message || ""),
   )
 }
 
-function sleep(ms, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(Object.assign(new Error("请求已取消"), { name: "AbortError" }))
-      return
-    }
-    const onAbort = () => {
-      clearTimeout(timer)
-      reject(Object.assign(new Error("请求已取消"), { name: "AbortError" }))
-    }
-    const timer = setTimeout(() => {
-      signal?.removeEventListener?.("abort", onAbort)
-      resolve()
-    }, ms)
-    timer.unref?.()
-    signal?.addEventListener?.("abort", onAbort, { once: true })
-  })
-}
-
-const MAX_ATTEMPTS = 3
-
-/** POST /api/v1/chat/completions（返回原始 Response） */
 export async function requestChat(fetchImpl, { token, device, payload, signal } = {}) {
-  const response = await fetchImpl(`${BASE}${PATHS.chat}`, {
+  const response = await fetchImpl(BASE + PATHS.chat, {
     method: "POST",
-    headers: {
-      ...authHeaders(token, device),
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-    },
+    headers: { ...jsonHeaders(token, device), Accept: "text/event-stream" },
     body: JSON.stringify(payload),
     signal,
+    redirect: "error",
   })
   if (!response.ok) {
-    const text = await response.text().catch(() => "")
-    let parsed = null
-    try { parsed = text ? JSON.parse(text) : null } catch { parsed = null }
-    throw httpError(response.status, parsed ?? text)
+    const text = await readLimitedText(response, 1024 * 1024)
+    let parsed
+    try { parsed = JSON.parse(text) } catch { parsed = text }
+    throw httpError(response.status, parsed)
   }
   if (!response.body) throw upstreamError("MuseWork 上游没有返回响应体", 503)
   return response
 }
 
-/**
- * 发一轮对话，返回 OpenAI 兼容的 Response。
- * stream=false 时把整条流折叠成 chat.completion。
- *
- * 并发：上游套餐有 max_concurrent_sessions（免费 1）。超过时回
- * CONCURRENT_SESSION_LIMIT_EXCEEDED；这里在**还没往外发任何正文**时
- * 退避重试（1s / 2s），并用 onDone 把账号级闸门释放掉。
- */
-export async function museChat({
-  fetchImpl,
-  token,
-  device,
-  agentId,
-  channelId,
-  modelKey,
-  reasoningEffort,
-  body,
-  stream,
-  signal,
-  onDone,
-}) {
-  const content = buildContent(body?.messages)
-  if (!content.length) throw upstreamError("messages 不能为空", 400, { code: "invalid_request" })
-  const userTimezone = timezoneOf()
-  const encoder = new TextEncoder()
+function stopReading(turn) {
+  const reader = turn?.reader
+  if (!reader) return
+  turn.reader = null
+  void reader.cancel().catch(() => {})
+  reader.releaseLock()
+}
 
-  let released = false
-  const release = () => {
-    if (released) return
-    released = true
-    try { onDone?.() } catch {}
-  }
+const sse = value => "data: " + JSON.stringify(value) + "\n\n"
 
-  /** 建会话 + 发请求；任一步失败都删掉刚建的会话。 */
-  const openTurn = async (turnSignal = signal) => {
-    const session = await createSession(fetchImpl, {
-      token, device, agentId, channelId, modelKey, reasoningEffort, signal: turnSignal,
+function encodeBatch(meta, batch, first) {
+  const frame = (delta, finishReason = null) => sse({
+    ...meta, object: "chat.completion.chunk",
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  })
+  let text = first ? frame({ role: "assistant", content: "" }) : ""
+  for (const { delta, finishReason } of batch) {
+    if (finishReason) text += frame({}, finishReason) + "data: [DONE]\n\n"
+    else if (delta.tool_calls) text += frame({
+      tool_calls: delta.tool_calls.map((call, index) => ({ index, ...call })),
     })
-    try {
-      const response = await requestChat(fetchImpl, {
-        token,
-        device,
-        signal: turnSignal,
-        payload: {
-          session_id: session.sessionId,
-          channel_id: session.channelId,
-          agent_id: session.agentId,
-          content,
-          subscribe_stream: true,
-          ...(modelKey ? { model_key: modelKey } : {}),
-          ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
-          ...(userTimezone ? { user_timezone: userTimezone } : {}),
-        },
-      })
-      return { session, response }
-    } catch (error) {
-      await deleteSession(fetchImpl, { token, device, sessionId: session.sessionId })
-      throw error
+    else text += frame(delta)
+  }
+  return encoder.encode(text)
+}
+
+async function completion(meta, readBatch) {
+  let content = ""
+  let reasoning = ""
+  let calls
+  let finish
+  for (let batch; (batch = await readBatch());) {
+    for (const { delta, finishReason } of batch) {
+      if (finishReason) finish = finishReason
+      else if (delta.content) content += delta.content
+      else if (delta.reasoning_content) reasoning += delta.reasoning_content
+      else if (delta.tool_calls) calls = delta.tool_calls
     }
   }
+  return Response.json({
+    ...meta, object: "chat.completion",
+    choices: [{
+      index: 0, finish_reason: finish,
+      message: {
+        role: "assistant", content: calls && !content ? null : content,
+        ...(reasoning ? { reasoning_content: reasoning } : {}),
+        ...(calls ? { tool_calls: calls } : {}),
+      },
+    }],
+  })
+}
 
-  if (!stream) {
-    try {
-      for (let attempt = 1; ; attempt += 1) {
-        try {
-          const { session, response } = await openTurn()
-          const translator = new MuseTranslator(modelKey)
-          const reader = response.body.getReader()
-          const decoder = new TextDecoder()
-          const frames = []
-          try {
-            while (!translator.done) {
-              const { done, value } = await reader.read()
-              if (done) {
-                frames.push(...translator.push(decoder.decode()))
-                break
-              }
-              frames.push(...translator.push(decoder.decode(value, { stream: true })))
-            }
-            frames.push(...translator.finish())
-          } finally {
-            try { await reader.cancel() } catch {}
-            await deleteSession(fetchImpl, { token, device, sessionId: session.sessionId })
-          }
-          return new Response(JSON.stringify(foldFrames(frames, modelKey)), {
-            status: 200,
-            headers: { "Content-Type": "application/json; charset=utf-8" },
-          })
-        } catch (error) {
-          // 非流式：整轮都没往外发，重试永远安全。
-          if (isConcurrencyLimit(error) && attempt < MAX_ATTEMPTS && !signal?.aborted) {
-            await sleep(1000 * attempt, signal)
-            continue
-          }
-          throw error
-        }
-      }
-    } finally {
-      release()
-    }
-  }
-
-  // ── 流式：先开回合，HTTP 层错误保留状态码 ──
-  // 本轮内部取消源：客户端取消响应流时用它 abort 上游 fetch，
-  // 否则上游智能体会继续跑完并扣积分（实测「中断也扣」）。
-  let turnController = new AbortController()
-  const turnSignal = () => (signal ? AbortSignal.any([signal, turnController.signal]) : turnController.signal)
-  let cancelled = false
-  let activeReader = null
-  let activeSessionId = ""
-
-  const openTurnWithRetry = async (attempt = 1, activeSignal = turnSignal()) => {
-    try {
-      return await openTurn(activeSignal)
-    } catch (error) {
-      if (isConcurrencyLimit(error) && attempt < MAX_ATTEMPTS && !activeSignal?.aborted) {
-        await sleep(1000 * attempt, activeSignal)
-        return openTurnWithRetry(attempt + 1, activeSignal)
-      }
-      throw error
-    }
-  }
-
+export async function museChat({
+  fetchImpl, token, device, agentId, channelId, modelKey, reasoningEffort, prepared, stream, signal, acquire,
+}) {
+  const downstream = stream ? new AbortController() : null
+  const upstreamSignal = downstream && signal ? AbortSignal.any([downstream.signal, signal]) : downstream?.signal ?? signal
+  const release = await acquire(upstreamSignal)
   let turn
+  let attempts = 0
+  let cleanup
+  let closeOnAbort
+
+  const onAbort = () => {
+    stopReading(turn)
+    closeOnAbort?.()
+  }
+  upstreamSignal?.addEventListener("abort", onAbort, { once: true })
+
+  const closeTurn = async () => {
+    const current = turn
+    turn = null
+    if (current) {
+      stopReading(current)
+      await deleteSession(fetchImpl, { token, device, sessionId: current.session.sessionId })
+    }
+  }
+  const finish = () => {
+    if (!cleanup) {
+      upstreamSignal?.removeEventListener("abort", onAbort)
+      closeOnAbort = undefined
+      cleanup = closeTurn().finally(release)
+    }
+    return cleanup
+  }
+
+  const canRetry = error => !upstreamSignal?.aborted && attempts < MAX_ATTEMPTS && isConcurrencyLimit(error)
+  const retry = async () => {
+    await closeTurn()
+    await delay(1000 * attempts, undefined, { signal: upstreamSignal })
+  }
+
+  const open = async () => {
+    for (;;) {
+      upstreamSignal?.throwIfAborted()
+      attempts += 1
+      try {
+        const session = await createSession(fetchImpl, { token, device, agentId, channelId, modelKey, reasoningEffort, signal: upstreamSignal })
+        turn = { session }
+        const userTimezone = timezoneOf()
+        const response = await requestChat(fetchImpl, {
+          token, device, signal: upstreamSignal,
+          payload: {
+            session_id: session.sessionId, channel_id: session.channelId, agent_id: session.agentId,
+            content: prepared.content, subscribe_stream: true,
+            ...(modelKey ? { model_key: modelKey } : {}),
+            ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+            ...(userTimezone ? { user_timezone: userTimezone } : {}),
+          },
+        })
+        turn.reader = response.body.getReader()
+        turn.decoder = new TextDecoder()
+        turn.translator = new MuseTranslator(prepared.toolPlan)
+        upstreamSignal?.throwIfAborted()
+        return
+      } catch (error) {
+        if (!canRetry(error)) throw error
+      }
+      await retry()
+    }
+  }
+
+  const readBatch = async () => {
+    for (;;) {
+      try {
+        const { translator, decoder, reader } = turn
+        while (!translator.done) {
+          upstreamSignal?.throwIfAborted()
+          const { done, value } = await reader.read()
+          upstreamSignal?.throwIfAborted()
+          const batch = translator.push(decoder.decode(value, { stream: !done }))
+          if (done && !translator.done) batch.push(...translator.finish())
+          if (batch.length) return batch
+        }
+        if (translator.error) throw translator.error
+        return null
+      } catch (error) {
+        if (turn?.translator?.started || !canRetry(error)) throw error
+      }
+      await retry()
+      await open()
+    }
+  }
+
+  const created = Math.floor(Date.now() / 1000)
+  const meta = { id: "chatcmpl-musework-" + randomUUID(), created, model: modelKey }
   try {
-    turn = await openTurnWithRetry()
+    await open() // Retain HTTP errors before committing downstream headers.
+    if (!stream) {
+      try { return await completion(meta, readBatch) } finally { void finish() }
+    }
   } catch (error) {
-    release()
+    void finish()
     throw error
   }
 
-  let closed = false
-  const close = () => {
-    if (closed) return
-    closed = true
-    release()
-  }
-
-  const streamBody = new ReadableStream({
-    async start(controller) {
-      const emit = (frames) => {
-        for (const frame of frames) controller.enqueue(encoder.encode(frame))
+  let first = true
+  let stopped = false
+  let pending
+  const afterPull = () => pending ? pending.then(finish, finish) : finish()
+  const body = new ReadableStream({
+    start(controller) {
+      closeOnAbort = () => {
+        if (stopped) return
+        stopped = true
+        controller.error(upstreamSignal.reason)
+        void afterPull()
       }
-
-      let attempt = 1
+      if (upstreamSignal.aborted) closeOnAbort()
+    },
+    async pull(controller) {
+      pending = readBatch()
       try {
-        let current = turn
-        while (true) {
-          let retry = false
-          const translator = new MuseTranslator(modelKey)
-          const reader = current.response.body.getReader()
-          activeReader = reader
-          activeSessionId = current.session.sessionId
-          const decoder = new TextDecoder()
-          try {
-            while (!translator.done) {
-              const { done, value } = await reader.read()
-              if (done) {
-                emit(translator.push(decoder.decode()))
-                emit(translator.finish())
-                break
-              }
-              try {
-                emit(translator.push(decoder.decode(value, { stream: true })))
-              } catch (error) {
-                // 还没往外发过任何帧 → 可以安全重试；已经发过正文就如实报错。
-                if (isConcurrencyLimit(error) && !translator.started && attempt < MAX_ATTEMPTS && !turnSignal().aborted) {
-                  retry = true
-                  break
-                }
-                throw error
-              }
-            }
-          } finally {
-            activeReader = null
-            try { await reader.cancel() } catch {}
-            await deleteSession(fetchImpl, { token, device, sessionId: current.session.sessionId })
-            activeSessionId = ""
-          }
-
-          if (!retry) break
-          attempt += 1
-          // 新一轮用新的取消源；sleep 期间客户端取消要能立刻退出。
-          turnController = new AbortController()
-          await sleep(1000 * (attempt - 1), turnSignal())
-          if (cancelled) break
-          current = await openTurnWithRetry(attempt)
+        const batch = await pending
+        if (stopped) return
+        controller.enqueue(encodeBatch(meta, batch, first))
+        first = false
+        if (batch.at(-1).finishReason) {
+          void finish()
+          controller.close()
         }
       } catch (error) {
-        if (!signal?.aborted && !cancelled) {
-          try {
-            const status = chatErrorStatus(error)
-            const code = errorCode(error)
-            const payload = {
-              error: {
-                message: error?.message || String(error),
-                type: status >= 500 ? "upstream_error" : "invalid_request_error",
-                code,
-                status,
-              },
-            }
-            emit([`data: ${JSON.stringify(payload)}\n\n`])
-          } catch {}
-        }
+        if (stopped) return
+        const status = chatErrorStatus(error)
+        const type = status >= 500 ? "upstream_error" : "invalid_request_error"
+        controller.enqueue(encoder.encode(sse({
+          error: { message: error?.message || String(error), type, code: errorCode(error), status },
+        })))
+        void finish()
+        controller.close()
       } finally {
-        try { controller.close() } catch {}
-        close()
+        pending = undefined
       }
     },
-    cancel() {
-      // 客户端取消：先 abort 上游 fetch（停止计费），再删会话、释放闸门。
-      cancelled = true
-      try { activeReader?.cancel?.() } catch {}
-      try { turnController.abort(new Error("客户端已取消")) } catch {}
-      if (activeSessionId) {
-        void deleteSession(fetchImpl, { token, device, sessionId: activeSessionId })
-        activeSessionId = ""
-      }
-      close()
+    cancel(reason) {
+      stopped = true
+      downstream.abort(reason)
+      return afterPull()
     },
-  })
+  }, { highWaterMark: 0 })
 
-  return new Response(streamBody, {
+  return new Response(body, {
     status: 200,
     headers: {
       "Content-Type": "text/event-stream; charset=utf-8",

@@ -53,7 +53,7 @@ export function cookieValue(headers, name) {
   return ""
 }
 
-function withTimeout(signal, timeoutMs) {
+export function withTimeout(signal, timeoutMs) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(new Error(`请求超过 ${Math.round(timeoutMs / 1000)} 秒`)), timeoutMs)
   timer.unref?.()
@@ -71,10 +71,35 @@ function withTimeout(signal, timeoutMs) {
   }
 }
 
-/**
- * 发一个 JSON 请求并尽力解析响应体。
- * 返回 { response, body, text }；HTTP 非 2xx **不抛**，由调用方决定怎么映射。
- */
+export async function readLimitedText(response, maxBytes) {
+  if (!response.body) return ""
+  const tooLarge = () => upstreamError("MuseWork 响应超过 " + Math.round(maxBytes / 1024) + " KiB 上限", 502, { internal: true })
+  const declared = Number(response.headers.get("content-length"))
+  if (declared > maxBytes) {
+    void response.body.cancel().catch(() => {})
+    throw tooLarge()
+  }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let size = 0
+  let text = ""
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) return text + decoder.decode()
+      size += value.byteLength
+      if (size > maxBytes) throw tooLarge()
+      text += decoder.decode(value, { stream: true })
+    }
+  } catch (error) {
+    void reader.cancel().catch(() => {})
+    throw error
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+/** 发出 JSON 请求。HTTP 非 2xx 留给调用方映射。 */
 export async function requestJson(fetchImpl, url, {
   method = "GET",
   headers = {},
@@ -87,20 +112,12 @@ export async function requestJson(fetchImpl, url, {
   const { signal: timed, cleanup } = withTimeout(signal, timeoutMs)
   try {
     const response = await fetchImpl(url, { method, headers, body, signal: timed, redirect })
-    const declared = Number(response.headers?.get?.("content-length"))
-    if (Number.isFinite(declared) && declared > maxBytes) {
-      try { await response.body?.cancel?.() } catch {}
-      throw upstreamError(`MuseWork 响应超过 ${Math.round(maxBytes / 1024)} KiB 上限`, 502, { internal: true })
-    }
-    const raw = await response.text()
-    if (Buffer.byteLength(raw, "utf8") > maxBytes) {
-      throw upstreamError(`MuseWork 响应超过 ${Math.round(maxBytes / 1024)} KiB 上限`, 502, { internal: true })
-    }
+    const raw = await readLimitedText(response, maxBytes)
     let json = null
     if (raw) {
       try { json = JSON.parse(raw) } catch { json = null }
     }
-    return { response, body: json, text: raw }
+    return { response, body: json }
   } catch (error) {
     if (error instanceof ApiError) throw error
     if (signal?.aborted) throw Object.assign(new Error("请求已取消"), { name: "AbortError" })

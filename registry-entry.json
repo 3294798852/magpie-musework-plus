@@ -1,11 +1,11 @@
 {
-  "package": "magpie-musework",
-  "name": "magpie-MuseWork",
+  "package": "magpie-musework-plus",
+  "name": "MuseWork Plus",
   "providers": [
     "musework"
   ],
   "summary": {
-    "en": "magpie-MuseWork: brings MuseWork (Muse AI) into magpie.",
-    "zh": "magpie-MuseWork：把 MuseWork（Muse AI 的 AI 工作伙伴）接进 magpie。"
+    "en": "MuseWork models with client function calling, streaming, image input and account quotas.",
+    "zh": "接入 MuseWork 模型，支持客户端函数调用、流式回复、图片和账号额度。"
   }
 }

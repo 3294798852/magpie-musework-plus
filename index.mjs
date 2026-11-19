@@ -9,6 +9,7 @@
 // 协议取证：解包 MuseWork-10.0.3-x64.exe → app.asar → dist-electron/main.cjs 与
 // dist/assets/*.js。端点、请求体字段、SSE 事件名都能在客户端自己的代码里逐字找到。
 
+import { createHash } from "node:crypto"
 import {
   API_BASE,
   BASE,
@@ -29,17 +30,19 @@ import {
   userIdOf,
 } from "./src/auth.mjs"
 import { chromiumLogin, findBrowser } from "./src/browser.mjs"
+import { createAccountCache } from "./src/cache.mjs"
 import {
-  clearAgentCache,
+  fetchBalance,
   fetchCatalog,
+  fetchSubscription,
   modelKeyOf,
   modelsResponse,
   resolveAgentChannel,
   staticModels,
 } from "./src/catalog.mjs"
-import { museChat, reasoningEffortOf } from "./src/chat.mjs"
+import { museChat, prepareChat, reasoningEffortOf } from "./src/chat.mjs"
 import { loadDevice } from "./src/device.mjs"
-import { createLimiter } from "./src/semaphore.mjs"
+import { createAccountLimiters } from "./src/semaphore.mjs"
 import {
   CODES,
   chatErrorStatus,
@@ -51,16 +54,28 @@ import {
 } from "./src/errors.mjs"
 import {
   claimDailyReward,
-  clearUsageCache,
-  computeUsage,
   fetchDailyRewardStatus,
+  usageOf,
 } from "./src/usage.mjs"
 
 const CATALOG_TTL = 10 * 60_000
+const AGENT_TTL = 5 * 60_000
+const BALANCE_TTL = 60_000
+const SUBSCRIPTION_TTL = 10 * 60_000
 const DEFAULT_TTL_MS = 365 * 24 * 3600_000
 
 function cacheKeyOf(auth) {
-  return String(auth?.uid || auth?.accountId || auth?.access || "").slice(-64)
+  const uid = auth?.uid || auth?.metadata?.userId
+  if (uid) return "uid:" + uid
+  if (auth?.accountId) return "account:" + auth.accountId
+  return createHash("sha256").update(auth?.access || "").digest("hex")
+}
+
+function concurrencyOf({ maxConcurrentSessions, maxConcurrentTasks } = {}) {
+  const sessions = Number(maxConcurrentSessions)
+  const tasks = Number(maxConcurrentTasks)
+  const limits = [sessions, tasks].filter(value => Number.isInteger(value) && value > 0)
+  return limits.length ? Math.min(...limits, 1000) : DEFAULT_MAX_CONCURRENCY
 }
 
 function loginErrorText(error) {
@@ -89,21 +104,14 @@ export const MuseWorkAuthPlugin = async (_ctx = {}, options = {}) => {
 
   let maxConcurrency = DEFAULT_MAX_CONCURRENCY
   let lastTtlMs = DEFAULT_TTL_MS
-  const catalogCache = new Map()
+  const catalogs = createAccountCache(CATALOG_TTL)
+  const agents = createAccountCache(AGENT_TTL)
+  const balances = createAccountCache(BALANCE_TTL)
+  const subscriptions = createAccountCache(SUBSCRIPTION_TTL)
+  const fallbackModels = staticModels()
   // 本机导入的游标：本机有多个账号时，每次登录导入下一个。
   const importedLocalAccounts = new Set()
-  // 账号级并发闸门：上游套餐 max_concurrent_sessions 是**每账号**的，
-  // 所以按 uid 各建一个；多个账号同时用时互不排队。
-  const limiters = new Map()
-  const limiterOf = (auth) => {
-    const key = cacheKeyOf(auth) || "default"
-    let limiter = limiters.get(key)
-    if (!limiter) {
-      limiter = createLimiter(DEFAULT_MAX_CONCURRENCY)
-      limiters.set(key, limiter)
-    }
-    return limiter
-  }
+  const limiters = createAccountLimiters()
 
   const syncTtl = (auth) => {
     const meta = Number(auth?.metadata?.ttlMs)
@@ -113,17 +121,13 @@ export const MuseWorkAuthPlugin = async (_ctx = {}, options = {}) => {
     if (remaining > 0) lastTtlMs = remaining
   }
 
-  const syncConcurrency = (auth) => {
-    const sessions = Number(auth?.metadata?.maxConcurrentSessions)
-    const tasks = Number(auth?.metadata?.maxConcurrentTasks)
-    // 会话闸门优先用 max_concurrent_sessions；套餐没给这个字段时退回 tasks，
-    // 否则付费账号会被默认值 1 误伤成完全串行。
-    const limit = Number.isInteger(sessions) && sessions > 0 ? sessions : tasks
-    if (Number.isInteger(limit) && limit > 0) {
-      limiterOf(auth).setLimit(Math.min(limit, 1000))
-      // 宿主只有一个 provider 级并发数：取各账号里的最大值，单账号仍由自己的闸门约束。
-      maxConcurrency = Math.max(maxConcurrency, Math.min(limit, 1000))
-    }
+  const syncConcurrency = (auth, key) => {
+    const subscription = subscriptions.peek(key)
+    const source = subscription?.maxConcurrentSessions || subscription?.maxConcurrentTasks ? subscription : auth.metadata
+    const limit = concurrencyOf(source)
+    limiters.update(key, limit)
+    maxConcurrency = Math.max(maxConcurrency, limit)
+    return limit
   }
 
   /** 用 token 换 magpie 登录态；token 过期但有 refresh 时自动续一次。 */
@@ -146,21 +150,15 @@ export const MuseWorkAuthPlugin = async (_ctx = {}, options = {}) => {
     }
   }
 
-  async function loadCatalog(auth) {
-    const key = cacheKeyOf(auth)
-    const hit = catalogCache.get(key)
-    if (hit && Date.now() - hit.at < CATALOG_TTL) return hit.models
+  async function loadCatalog(auth, key, signal) {
     try {
-      const { models } = await fetchCatalog(fetchImpl, { token: auth.access, device, locale: "zh-CN" })
-      catalogCache.set(key, { at: Date.now(), models })
-      if (catalogCache.size > 64) {
-        for (const [oldKey, item] of catalogCache) {
-          if (Date.now() - item.at > CATALOG_TTL) catalogCache.delete(oldKey)
-        }
-      }
-      return models
+      return await catalogs.get(key, async () => {
+        const { models } = await fetchCatalog(fetchImpl, { token: auth.access, device, locale: "zh-CN" })
+        return models
+      }, signal)
     } catch {
-      return hit?.models ?? staticModels()
+      signal?.throwIfAborted()
+      return catalogs.peek(key) ?? fallbackModels
     }
   }
 
@@ -173,7 +171,7 @@ export const MuseWorkAuthPlugin = async (_ctx = {}, options = {}) => {
         npm: SDK,
         api: API_BASE,
         // 未登录也要有内容，否则显示 "0 models"
-        models: staticModels(),
+        models: fallbackModels,
         searches: false,
         // 上游自己回答 web_search 吗？MuseWork 是智能体，会自己联网；
         // 但 magpie 的 web_search 工具是另一套，交给宿主即可。
@@ -259,7 +257,7 @@ export const MuseWorkAuthPlugin = async (_ctx = {}, options = {}) => {
                   fetchImpl,
                 })
               })
-              .then((cred) => completeLogin(cred))
+              .then((cred) => completeLogin(cred, { signal: controller.signal }))
             login.catch(() => {})
             return {
               url: `${BASE}/chat`,
@@ -272,7 +270,8 @@ export const MuseWorkAuthPlugin = async (_ctx = {}, options = {}) => {
               close: () => controller.abort(),
               async callback(_value, { signal } = {}) {
                 const onAbort = () => controller.abort()
-                signal?.addEventListener("abort", onAbort, { once: true })
+                if (signal?.aborted) onAbort()
+                else signal?.addEventListener("abort", onAbort, { once: true })
                 try {
                   return await login
                 } catch (error) {
@@ -341,7 +340,7 @@ export const MuseWorkAuthPlugin = async (_ctx = {}, options = {}) => {
         const auth = await getAuth()
         if (!auth?.access) return {}
         syncTtl(auth)
-        syncConcurrency(auth)
+        syncConcurrency(auth, cacheKeyOf(auth))
 
         return {
           baseURL: API_BASE,
@@ -354,9 +353,9 @@ export const MuseWorkAuthPlugin = async (_ctx = {}, options = {}) => {
               return errorResponse("MuseWork 未登录：请重新登录", 401, CODES.signInRequired)
             }
             syncTtl(fresh)
-            syncConcurrency(fresh)
-
+            const key = cacheKeyOf(fresh)
             const request = input instanceof Request ? input : null
+            const signal = init?.signal ?? request?.signal
             const url = typeof input === "string"
               ? input
               : input instanceof URL
@@ -366,7 +365,7 @@ export const MuseWorkAuthPlugin = async (_ctx = {}, options = {}) => {
             const path = url.split("?")[0]
 
             if (method === "GET" && /\/models$/u.test(path)) {
-              return modelsResponse(await loadCatalog(fresh))
+              return modelsResponse(await loadCatalog(fresh, key, signal))
             }
             if (!/\/chat\/completions$/u.test(path)) {
               return errorResponse(
@@ -383,38 +382,28 @@ export const MuseWorkAuthPlugin = async (_ctx = {}, options = {}) => {
               return errorResponse("请求体不是合法的 JSON", 400, CODES.invalidRequest)
             }
 
-            const signal = init?.signal ?? request?.signal
             const stream = body?.stream !== false
             const modelKey = modelKeyOf(body?.model, FALLBACK_MODELS[0].id)
             const reasoningEffort = reasoningEffortOf(body)
 
-            let release = null
             try {
-              const agent = await resolveAgentChannel(fetchImpl, {
-                token: fresh.access,
-                device,
-                signal,
-                cacheKey: cacheKeyOf(fresh),
-              })
-              // 上游免费套餐 max_concurrent_sessions = 1：同一账号的 turn 串行，
-              // 超出的请求在这里排队（否则「测试模型」一次并发 5 个会回
-              // CONCURRENT_SESSION_LIMIT_EXCEEDED）。
-              release = await limiterOf(fresh).acquire(signal)
+              const prepared = prepareChat(body)
+              const agent = await agents.get(key, () => resolveAgentChannel(fetchImpl, {
+                token: fresh.access, device,
+              }), signal)
               return await museChat({
                 fetchImpl,
                 token: fresh.access,
                 device,
-                agentId: agent.agentId,
-                channelId: agent.channelId,
+                ...agent,
                 modelKey,
                 reasoningEffort,
-                body,
+                prepared,
                 stream,
                 signal,
-                onDone: release,
+                acquire: turnSignal => limiters.acquire(key, syncConcurrency(fresh, key), turnSignal),
               })
             } catch (error) {
-              release?.()
               signal?.throwIfAborted?.()
               return errorResponse(
                 error?.message || String(error),
@@ -432,19 +421,14 @@ export const MuseWorkAuthPlugin = async (_ctx = {}, options = {}) => {
         const auth = await getAuth()
         if (!auth?.access) return { error: "未登录", windows: [] }
         try {
-          return await computeUsage({
-            fetchImpl,
-            token: auth.access,
-            device,
-            accountId: String(auth.uid || auth.accountId || ""),
-            onSubscription: (subscription) => {
-              const sessions = subscription?.maxConcurrentSessions || subscription?.maxConcurrentTasks
-              if (sessions) limiterOf(auth).setLimit(Math.min(sessions, 1000))
-              if (subscription?.maxConcurrentTasks) {
-                maxConcurrency = Math.max(maxConcurrency, Math.min(subscription.maxConcurrentTasks, 1000))
-              }
-            },
-          })
+          const key = cacheKeyOf(auth)
+          const info = { token: auth.access, device }
+          const [usage, subscription] = await Promise.all([
+            balances.get(key, async () => usageOf(await fetchBalance(fetchImpl, info), auth.uid || auth.accountId)),
+            subscriptions.get(key, () => fetchSubscription(fetchImpl, info)).catch(() => subscriptions.peek(key)),
+          ])
+          syncConcurrency(auth, key)
+          return subscription?.plan ? { ...usage, plan: subscription.plan } : usage
         } catch (error) {
           if (isAuthFailure(error)) {
             return { error: "MuseWork 登录已失效，请重新登录", windows: [], signIn: "expired" }
@@ -471,8 +455,7 @@ export const MuseWorkAuthPlugin = async (_ctx = {}, options = {}) => {
           }
 
           const claimed = await claimDailyReward(fetchImpl, { token: auth.access, device })
-          // 领取会改变余额；让额度卡片下一次立刻重新拉，而不是等 60s 缓存。
-          clearUsageCache()
+          balances.invalidate(cacheKeyOf(auth))
           if (claimed.alreadyClaimed || (claimed.claimedToday && claimed.grantedCredits === 0)) {
             return {
               outcome: "done",
@@ -502,10 +485,11 @@ export const MuseWorkAuthPlugin = async (_ctx = {}, options = {}) => {
     provider: {
       id: PROVIDER,
       async models(_fallback, { auth } = {}) {
-        if (!auth?.access) return staticModels()
+        if (!auth?.access) return fallbackModels
         syncTtl(auth)
-        syncConcurrency(auth)
-        return loadCatalog(auth)
+        const key = cacheKeyOf(auth)
+        syncConcurrency(auth, key)
+        return loadCatalog(auth, key)
       },
     },
 
@@ -535,10 +519,4 @@ export const _internal = Object.freeze({
   accountNameOf,
   userIdOf,
   cacheKeyOf,
-  clearCaches: () => {
-    catalogCache.clear()
-    clearAgentCache()
-    clearUsageCache()
-    limiters.clear()
-  },
 })

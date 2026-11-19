@@ -16,10 +16,8 @@
 import { BASE, PATHS } from "./constants.mjs"
 import { httpError, upstreamError } from "./errors.mjs"
 import { authHeaders, jsonHeaders, requestJson, unwrap } from "./http.mjs"
-import { fetchBalance, fetchSubscription } from "./catalog.mjs"
 
-const USAGE_TTL = 60_000
-const cache = new Map()
+const creditFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 })
 
 function number(value) {
   const n = Number(value)
@@ -28,7 +26,7 @@ function number(value) {
 
 function format(value) {
   const n = Math.round(number(value) * 100) / 100
-  return n.toLocaleString("en-US", { maximumFractionDigits: 2 })
+  return creditFormat.format(n)
 }
 
 /** 下一个北京时间 00:00（ISO 字符串；magpie 只认 ISO / 数字）。 */
@@ -43,21 +41,16 @@ function nextBeijingMidnight(now = Date.now()) {
   return new Date(next).toISOString()
 }
 
-export async function computeUsage({ fetchImpl, token, device, signal, accountId = "", onSubscription } = {}) {
-  const key = String(accountId || token || "").slice(-64)
-  const hit = cache.get(key)
-  if (hit && Date.now() - hit.at < USAGE_TTL) return hit.value
-
-  const [balance, subscription] = await Promise.all([
-    fetchBalance(fetchImpl, { token, device, signal }),
-    fetchSubscription(fetchImpl, { token, device, signal }).catch(() => null),
-  ])
-  if (subscription && typeof onSubscription === "function") onSubscription(subscription)
-
-  const total = balance.reduce((sum, item) => sum + number(item.total_credits), 0)
-  const remaining = balance.reduce((sum, item) => sum + number(item.remaining_credits), 0)
+export function usageOf(balance, accountId = "") {
+  let total = 0
+  let remaining = 0
+  let hasDaily = false
+  for (const item of balance) {
+    total += number(item.total_credits)
+    remaining += number(item.remaining_credits)
+    hasDaily ||= item.credit_type === "daily"
+  }
   const used = Math.max(0, total - remaining)
-  const hasDaily = balance.some((item) => String(item.credit_type) === "daily")
 
   const windows = []
   if (total > 0) {
@@ -82,17 +75,10 @@ export async function computeUsage({ fetchImpl, token, device, signal, accountId
     })
   }
 
-  const value = {
+  return {
     ...(accountId ? { user: String(accountId) } : {}),
-    ...(subscription?.plan ? { plan: subscription.plan } : {}),
     windows,
   }
-  cache.set(key, { at: Date.now(), value })
-  return value
-}
-
-export function clearUsageCache() {
-  cache.clear()
 }
 
 /** 每日奖励状态：GET /api/v1/daily-rewards/status */

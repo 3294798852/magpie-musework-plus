@@ -39,14 +39,14 @@ export function staticModels() {
     return [model.id, {
       name: model.name,
       ...(Number.isFinite(model.rate) ? { rate: model.rate } : {}),
-      tool_call: false,
+      tool_call: true,
       attachment: vision,
       ...(model.efforts.length ? { reasoning: true, variants } : {}),
       capabilities: {
         temperature: false,
         reasoning: model.efforts.length > 0,
         attachment: vision,
-        toolcall: false,
+        toolcall: true,
         input: { text: true, image: vision, audio: false, video: false, pdf: false },
         output: { text: true, image: false, audio: false, video: false, pdf: false },
       },
@@ -79,7 +79,7 @@ export function modelEntry(raw, providerId = PROVIDER) {
       temperature: false,
       reasoning: efforts.length > 0,
       attachment: vision,
-      toolcall: false,
+      toolcall: true,
       input: { text: true, image: vision, audio: false, video: false, pdf: false },
       output: { text: true, image: false, audio: false, video: false, pdf: false },
       interleaved: false,
@@ -138,8 +138,8 @@ export async function fetchCatalog(fetchImpl, { token, device, locale, signal } 
 export function modelsResponse(entries = staticModels()) {
   return new Response(JSON.stringify({
     object: "list",
-    data: Object.values(entries).map((model) => ({
-      id: model.id,
+    data: Object.entries(entries).map(([id, model]) => ({
+      id,
       object: "model",
       created: 0,
       owned_by: PROVIDER,
@@ -148,15 +148,8 @@ export function modelsResponse(entries = staticModels()) {
   }), { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } })
 }
 
-/** 当前账号的 agent + channel（缓存 5 分钟）。 */
-const agentCache = new Map()
-const AGENT_TTL = 5 * 60_000
-
-export async function resolveAgentChannel(fetchImpl, { token, device, signal, cacheKey = "" } = {}) {
-  const key = cacheKey || String(token || "").slice(-24)
-  const hit = agentCache.get(key)
-  if (hit && Date.now() - hit.at < AGENT_TTL) return hit.value
-
+/** 当前账号的 agent + channel。 */
+export async function resolveAgentChannel(fetchImpl, { token, device, signal } = {}) {
   const url = new URL(PATHS.agents, BASE)
   url.searchParams.set("specialty", "all")
   const { response, body } = await requestJson(fetchImpl, url.toString(), {
@@ -173,8 +166,9 @@ export async function resolveAgentChannel(fetchImpl, { token, device, signal, ca
     throw upstreamError("MuseWork 账号下没有可用的智能体（agent）", 502, { code: "upstream_error" })
   }
   const agent = agents.find((item) => item?.agent_status === "active") || agents[0]
-  const channel = (Array.isArray(agent?.channels) ? agent.channels : [])
-    .find((item) => item?.channel_type === "web" && item?.channel_id) || agent?.channels?.find((item) => item?.channel_id)
+  const channels = Array.isArray(agent?.channels) ? agent.channels : []
+  const channel = channels.find((item) => item?.channel_type === "web" && item?.channel_id)
+    || channels.find((item) => item?.channel_id)
   if (!channel?.channel_id) {
     throw upstreamError("MuseWork 智能体没有可用的频道（channel）", 502, { internal: true })
   }
@@ -184,17 +178,7 @@ export async function resolveAgentChannel(fetchImpl, { token, device, signal, ca
     channelId: String(channel.channel_id),
   }
   if (!value.agentId) throw upstreamError("MuseWork 智能体缺少 agent_id", 502, { internal: true })
-  agentCache.set(key, { at: Date.now(), value })
-  if (agentCache.size > 64) {
-    for (const [oldKey, item] of agentCache) {
-      if (Date.now() - item.at > AGENT_TTL) agentCache.delete(oldKey)
-    }
-  }
   return value
-}
-
-export function clearAgentCache() {
-  agentCache.clear()
 }
 
 /** 套餐：GET /api/v1/subscription → quota.max_concurrent_tasks / tier_label / daily_credits */

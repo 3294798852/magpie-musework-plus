@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { createLimiter } from "../src/semaphore.mjs"
+import { createAccountLimiters, createLimiter } from "../src/semaphore.mjs"
 
 test("并发 1：第二个 acquire 排队，release 后放行", async () => {
   const limiter = createLimiter(1)
@@ -68,4 +68,21 @@ test("默认与非法值回落 1", () => {
   assert.equal(createLimiter(0).limit, 1)
   assert.equal(createLimiter("x").limit, 1)
   assert.equal(createLimiter(5000).limit, 1000)
+})
+
+test("account limiters isolate concurrent IDs and remove idle queues", async () => {
+  const accounts = createAccountLimiters()
+  const first = await accounts.acquire("free", 1)
+  const controller = new AbortController()
+  const queued = accounts.acquire("free", 1, controller.signal)
+  const paidOne = await accounts.acquire("paid", 2)
+  const paidTwo = await accounts.acquire("paid", 2)
+  assert.equal(accounts.size, 2)
+  controller.abort()
+  await assert.rejects(queued, { name: "AbortError" })
+  first()
+  assert.equal(accounts.size, 1)
+  paidOne()
+  paidTwo()
+  assert.equal(accounts.size, 0)
 })
